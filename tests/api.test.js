@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { aliceResponse, fitAliceText, isSearchIntent, safeHistory } from "../api/index.js";
+import { aliceResponse, fitAliceText, isSearchIntent, safeHistory, thinkingConfigFor } from "../api/index.js";
 
 test("Alice response uses required response envelope", () => {
   const result = aliceResponse("Привет", false, [{ role: "user", text: "тест" }]);
@@ -60,4 +60,11 @@ test("launch request returns a valid Alice greeting without external API keys", 
   assert.equal(payload.version, "1.0");
   assert.match(payload.response.text, /Привет/);
   assert.equal(payload.response.end_session, false);
+});
+
+test("thinking is kept to a minimum so Gemini answers in time", () => {
+  assert.deepEqual(thinkingConfigFor("gemini-3.5-flash-lite"), { thinkingLevel: "minimal" });
+  assert.deepEqual(thinkingConfigFor("gemini-3-pro-preview"), { thinkingLevel: "low" });
+  assert.deepEqual(thinkingConfigFor("gemini-2.5-flash"), { thinkingBudget: 0 });
+  assert.equal(thinkingConfigFor("gemini-2.0-flash"), undefined);
 });

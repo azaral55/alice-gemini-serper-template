@@ -45,6 +45,13 @@ function fitAliceText(value) {
   return (lastSpace > 200 ? candidate.slice(0, lastSpace) : candidate).trim() + "…";
 }
 
+// Thinking makes Gemini answer too slowly for Alice, so ask for the smallest amount the model allows.
+function thinkingConfigFor(model) {
+  if (/^gemini-2\.5-flash/.test(model)) return { thinkingBudget: 0 };
+  if (/^gemini-[3-9]/.test(model)) return { thinkingLevel: /pro/.test(model) ? "low" : "minimal" };
+  return undefined;
+}
+
 function isSearchIntent(text) {
   return /\b(latest|today|current|news|weather|price|exchange rate|recent|search|look up)\b|сегодня|сейчас|последн|новост|погод|курс валют|найди|поищи|актуальн|сколько стоит|свежие данные/i.test(text);
 }
@@ -128,7 +135,8 @@ async function askGemini(text, history, searchContext, timeoutMs) {
     : text;
   contents.push({ role: "user", parts: [{ text: prompt }] });
 
-  const { response, data } = await fetchJson(
+  const startedAt = Date.now();
+  const callGemini = thinkingConfig => fetchJson(
     `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
     {
       method: "POST",
@@ -141,12 +149,21 @@ async function askGemini(text, history, searchContext, timeoutMs) {
         contents,
         generationConfig: {
           temperature: 0.5,
-          maxOutputTokens: 240
+          maxOutputTokens: 240,
+          ...(thinkingConfig && { thinkingConfig })
         }
       })
     },
-    Math.min(GEMINI_TIMEOUT_MS, timeoutMs)
+    Math.min(GEMINI_TIMEOUT_MS, timeoutMs) - (Date.now() - startedAt)
   );
+
+  const thinkingConfig = thinkingConfigFor(model);
+  let { response, data } = await callGemini(thinkingConfig);
+  if (response.status === 400 && thinkingConfig) {
+    // Some models reject the thinking setting; retry once with the model's defaults.
+    console.warn("Gemini rejected thinkingConfig; retrying without it.");
+    ({ response, data } = await callGemini(undefined));
+  }
 
   if (!response.ok) {
     const status = Number(response.status);
@@ -245,4 +262,4 @@ export default async function handler(req, res) {
   }
 }
 
-export { aliceResponse, fitAliceText, isSearchIntent, safeHistory };
+export { aliceResponse, fitAliceText, isSearchIntent, safeHistory, thinkingConfigFor };
