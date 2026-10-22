@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { aliceResponse, cutAtSentence, fitAliceText, isSearchIntent, safeHistory, thinkingConfigFor } from "../api/index.js";
+import { aliceResponse, cutAtSentence, fitAliceText, isContinueCommand, isSearchIntent, safeHistory, thinkingConfigFor } from "../api/index.js";
 
 test("Alice response uses required response envelope", () => {
   const result = aliceResponse("Привет", false, [{ role: "user", text: "тест" }]);
@@ -73,4 +73,11 @@ test("partial answers are cut at the last finished sentence", () => {
   assert.equal(cutAtSentence("Первый город Москва. Второй"), "Первый город Москва.");
   assert.equal(cutAtSentence("Готово!"), "Готово!");
   assert.equal(cutAtSentence("Москва и"), "Москва и…");
+});
+
+test("continue phrases are recognised for picking up a background answer", () => {
+  assert.equal(isContinueCommand("дальше"), true);
+  assert.equal(isContinueCommand("Ну что?"), true);
+  assert.equal(isContinueCommand("алиса дальше"), true);
+  assert.equal(isContinueCommand("что дальше будет с ценами"), false);
 });

@@ -1,3 +1,6 @@
+import { randomUUID } from "node:crypto";
+import { waitUntil } from "@vercel/functions";
+
 const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
@@ -5,6 +8,14 @@ const MAX_ALICE_TEXT = 1024;
 const TOTAL_RESPONSE_BUDGET_MS = 4100;
 const SERPER_TIMEOUT_MS = 600;
 const GEMINI_TIMEOUT_MS = 3500;
+// With Redis connected, slow answers keep generating after Alice's deadline and are picked up on "дальше".
+const BACKGROUND_GEMINI_TIMEOUT_MS = 25000;
+const JOB_TTL_SECONDS = 600;
+const REDIS_TIMEOUT_MS = 800;
+const JOB_POLL_INTERVAL_MS = 300;
+
+const THINKING_TEXT = "Дай подумать пару секунд. Потом скажи «дальше».";
+const STILL_THINKING_TEXT = "Ещё думаю. Скажи «дальше» через пару секунд.";
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -156,7 +167,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
         }
       })
     },
-    Math.min(GEMINI_TIMEOUT_MS, timeoutMs) - (Date.now() - startedAt)
+    timeoutMs - (Date.now() - startedAt)
   );
 
   const thinkingConfig = modelsWithoutThinkingConfig.has(model) ? undefined : thinkingConfigFor(model);
@@ -270,6 +281,78 @@ function errorForUser(error) {
   }
 }
 
+function isContinueCommand(text) {
+  const normalized = String(text).toLowerCase().replace(/ё/g, "е").replace(/[^a-zа-я ]+/g, " ").replace(/\s+/g, " ").trim();
+  return /^(алиса )?(дальше|ну|ну что|ну и|ну и что|и что|что там|ответ|готово|готов|продолжай|продолжи|давай|ну давай)$/.test(normalized);
+}
+
+function redisConfig() {
+  const url = process.env.KV_REST_API_URL || process.env.UPSTASH_REDIS_REST_URL;
+  const token = process.env.KV_REST_API_TOKEN || process.env.UPSTASH_REDIS_REST_TOKEN;
+  return url && token ? { url: url.replace(/\/+$/, ""), token } : null;
+}
+
+async function redis(command) {
+  const config = redisConfig();
+  const { response, data } = await fetchJson(
+    config.url,
+    {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${config.token}`,
+        "Content-Type": "application/json"
+      },
+      body: JSON.stringify(command)
+    },
+    REDIS_TIMEOUT_MS
+  );
+  if (!response.ok || data?.error) throw new Error("REDIS_FAILED");
+  return data.result;
+}
+
+async function readJob(key) {
+  const value = await redis(["GET", key]);
+  if (!value) return null;
+  try {
+    return JSON.parse(value);
+  } catch {
+    return null;
+  }
+}
+
+function writeJob(key, job) {
+  return redis(["SET", key, JSON.stringify(job), "EX", String(JOB_TTL_SECONDS)]);
+}
+
+// Stores the background result unless the user has already asked something newer.
+async function finishJob(key, id, update) {
+  const current = await readJob(key);
+  if (current?.id !== id) return;
+  await writeJob(key, { ...current, ...update });
+}
+
+async function waitForJob(key, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  let job = await readJob(key);
+  while (job?.status === "pending" && Date.now() + JOB_POLL_INTERVAL_MS < deadline) {
+    await new Promise(resolve => setTimeout(resolve, JOB_POLL_INTERVAL_MS));
+    job = await readJob(key);
+  }
+  return job;
+}
+
+function withHistory(history, question, answer) {
+  return [
+    ...history,
+    { role: "user", text: question.slice(0, MAX_HISTORY_MESSAGE_CHARS) },
+    { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
+  ].slice(-MAX_HISTORY_MESSAGES);
+}
+
+function timeout(ms) {
+  return new Promise(resolve => setTimeout(() => resolve(null), Math.max(0, ms)));
+}
+
 export default async function handler(req, res) {
   if (req.method === "GET") {
     return res.status(200).json({
@@ -298,27 +381,64 @@ export default async function handler(req, res) {
     ));
   }
 
+  const sessionId = String(body?.session?.session_id || "");
+  const jobKey = redisConfig() && sessionId ? `alice:job:${sessionId}` : null;
+
   try {
+    if (jobKey && isContinueCommand(text)) {
+      const job = await waitForJob(jobKey, remainingMs() - 600).catch(error => {
+        console.warn("Could not read the background answer:", error.message);
+        return null;
+      });
+      if (job?.status === "pending") {
+        return res.status(200).json(aliceResponse(STILL_THINKING_TEXT, false, oldHistory));
+      }
+      if (job?.status === "done") {
+        await redis(["DEL", jobKey]).catch(() => {});
+        return res.status(200).json(aliceResponse(job.answer, false, withHistory(oldHistory, job.question, job.answer)));
+      }
+      if (job?.status === "error") {
+        await redis(["DEL", jobKey]).catch(() => {});
+        return res.status(200).json(aliceResponse(errorForUser(new Error(job.error)), false, oldHistory));
+      }
+      // Nothing is waiting, so treat the phrase as an ordinary question.
+    }
+
     let searchContext = "";
     if (isSearchIntent(text) && process.env.SERPER_API_KEY) {
       // Search has a very short budget because Alice expects a response within 4.5 seconds.
       searchContext = await searchWeb(text, Math.min(SERPER_TIMEOUT_MS, Math.max(0, remainingMs() - 2600)));
     }
 
-    const answer = await askGemini(
-      text,
-      oldHistory,
-      searchContext,
-      Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600))
+    const quickBudgetMs = Math.max(0, Math.min(GEMINI_TIMEOUT_MS, remainingMs() - 600));
+
+    if (!jobKey) {
+      const answer = await askGemini(text, oldHistory, searchContext, quickBudgetMs);
+      return res.status(200).json(aliceResponse(answer, false, withHistory(oldHistory, text, answer)));
+    }
+
+    const geminiAnswer = askGemini(text, oldHistory, searchContext, BACKGROUND_GEMINI_TIMEOUT_MS);
+    const quickAnswer = await Promise.race([geminiAnswer, timeout(quickBudgetMs)]);
+    if (quickAnswer !== null) {
+      return res.status(200).json(aliceResponse(quickAnswer, false, withHistory(oldHistory, text, quickAnswer)));
+    }
+
+    // Gemini needs more time than Alice allows: keep it running and hand the answer over on "дальше".
+    const id = randomUUID();
+    try {
+      await writeJob(jobKey, { id, status: "pending", question: text });
+    } catch (error) {
+      console.warn("Could not save the pending answer:", error.message);
+      throw new Error("TIME_BUDGET_EXHAUSTED");
+    }
+    console.log("Gemini is still answering; continuing in the background.");
+    waitUntil(
+      geminiAnswer
+        .then(answer => finishJob(jobKey, id, { status: "done", answer }))
+        .catch(error => finishJob(jobKey, id, { status: "error", error: error?.message || "GEMINI_REQUEST_FAILED" }))
+        .catch(error => console.warn("Could not save the background answer:", error.message))
     );
-
-    const history = [
-      ...oldHistory,
-      { role: "user", text: text.slice(0, MAX_HISTORY_MESSAGE_CHARS) },
-      { role: "model", text: answer.slice(0, MAX_HISTORY_MESSAGE_CHARS) }
-    ].slice(-MAX_HISTORY_MESSAGES);
-
-    return res.status(200).json(aliceResponse(answer, false, history));
+    return res.status(200).json(aliceResponse(THINKING_TEXT, false, oldHistory));
   } catch (error) {
     const safeError = error?.name === "AbortError" ? new Error("TIME_BUDGET_EXHAUSTED") : error;
     console.warn("Alice webhook returned a fallback response:", safeError?.message || "unknown error");
@@ -326,4 +446,4 @@ export default async function handler(req, res) {
   }
 }
 
-export { aliceResponse, cutAtSentence, fitAliceText, isSearchIntent, safeHistory, thinkingConfigFor };
+export { aliceResponse, cutAtSentence, fitAliceText, isContinueCommand, isSearchIntent, safeHistory, thinkingConfigFor };
