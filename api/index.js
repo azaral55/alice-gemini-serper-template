@@ -170,7 +170,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   }
 
   if (result.timedOut && !result.text.trim()) {
-    console.warn(`Gemini sent nothing within ${Date.now() - startedAt} ms.`);
+    console.warn(`Gemini (${model}) sent nothing within ${Date.now() - startedAt} ms.`);
     throw new Error("TIME_BUDGET_EXHAUSTED");
   }
 
@@ -195,6 +195,7 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   if (result.finishReason === "MAX_TOKENS") {
     console.warn("Gemini reached the output token limit.");
   }
+  console.log(`Gemini (${model}) answered in ${Date.now() - startedAt} ms.`);
   return answer;
 }
 
