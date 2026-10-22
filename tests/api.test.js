@@ -1,6 +1,6 @@
 import test from "node:test";
 import assert from "node:assert/strict";
-import { aliceResponse, fitAliceText, isSearchIntent, safeHistory, thinkingConfigFor } from "../api/index.js";
+import { aliceResponse, cutAtSentence, fitAliceText, isSearchIntent, safeHistory, thinkingConfigFor } from "../api/index.js";
 
 test("Alice response uses required response envelope", () => {
   const result = aliceResponse("Привет", false, [{ role: "user", text: "тест" }]);
@@ -67,4 +67,10 @@ test("thinking is kept to a minimum so Gemini answers in time", () => {
   assert.deepEqual(thinkingConfigFor("gemini-3-pro-preview"), { thinkingLevel: "low" });
   assert.deepEqual(thinkingConfigFor("gemini-2.5-flash"), { thinkingBudget: 0 });
   assert.equal(thinkingConfigFor("gemini-2.0-flash"), undefined);
+});
+
+test("partial answers are cut at the last finished sentence", () => {
+  assert.equal(cutAtSentence("Первый город Москва. Второй"), "Первый город Москва.");
+  assert.equal(cutAtSentence("Готово!"), "Готово!");
+  assert.equal(cutAtSentence("Москва и"), "Москва и…");
 });

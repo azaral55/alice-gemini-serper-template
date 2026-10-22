@@ -2,9 +2,9 @@ const DEFAULT_MODEL = "gemini-3.5-flash-lite";
 const MAX_HISTORY_MESSAGES = 8;
 const MAX_HISTORY_MESSAGE_CHARS = 1200;
 const MAX_ALICE_TEXT = 1024;
-const TOTAL_RESPONSE_BUDGET_MS = 3600;
+const TOTAL_RESPONSE_BUDGET_MS = 3800;
 const SERPER_TIMEOUT_MS = 600;
-const GEMINI_TIMEOUT_MS = 2500;
+const GEMINI_TIMEOUT_MS = 3000;
 
 const SYSTEM_PROMPT = [
   "Ты — полезный голосовой помощник в навыке Яндекс Алисы.",
@@ -136,8 +136,8 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   contents.push({ role: "user", parts: [{ text: prompt }] });
 
   const startedAt = Date.now();
-  const callGemini = thinkingConfig => fetchJson(
-    `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent`,
+  const callGemini = thinkingConfig => streamGemini(
+    `https://generativelanguage.googleapis.com/v1beta/models/${model}:streamGenerateContent?alt=sse`,
     {
       method: "POST",
       headers: {
@@ -158,35 +158,90 @@ async function askGemini(text, history, searchContext, timeoutMs) {
   );
 
   const thinkingConfig = thinkingConfigFor(model);
-  let { response, data } = await callGemini(thinkingConfig);
-  if (response.status === 400 && thinkingConfig) {
+  let result = await callGemini(thinkingConfig);
+  if (result.status === 400 && thinkingConfig) {
     // Some models reject the thinking setting; retry once with the model's defaults.
     console.warn("Gemini rejected thinkingConfig; retrying without it.");
-    ({ response, data } = await callGemini(undefined));
+    result = await callGemini(undefined);
   }
 
-  if (!response.ok) {
-    const status = Number(response.status);
+  if (!result.ok) {
+    const status = Number(result.status);
     console.error("Gemini request failed with HTTP", status);
     if (status === 401 || status === 403) throw new Error("GEMINI_KEY_REJECTED");
     if (status === 429) throw new Error("GEMINI_QUOTA");
     throw new Error("GEMINI_REQUEST_FAILED");
   }
 
-  const candidate = data?.candidates?.[0];
-  const answer = (candidate?.content?.parts || [])
-    .map(part => typeof part.text === "string" ? part.text : "")
-    .join("")
-    .trim();
-
+  const answer = result.text.trim();
   if (!answer) {
-    if (data?.promptFeedback?.blockReason) throw new Error("GEMINI_BLOCKED");
+    if (result.timedOut) throw new Error("TIME_BUDGET_EXHAUSTED");
+    if (result.blocked) throw new Error("GEMINI_BLOCKED");
     throw new Error("GEMINI_EMPTY_RESPONSE");
   }
-  if (candidate?.finishReason === "MAX_TOKENS") {
+  if (result.timedOut) {
+    // Alice would drop a late reply entirely, so answer with what Gemini managed to say in time.
+    console.warn("Gemini did not finish in time; returning the partial answer.");
+    return cutAtSentence(answer);
+  }
+  if (result.finishReason === "MAX_TOKENS") {
     console.warn("Gemini reached the output token limit.");
   }
   return answer;
+}
+
+// Reads Gemini's server-sent events, keeping the text received so far if the time budget runs out.
+async function streamGemini(url, options, timeoutMs) {
+  const controller = new AbortController();
+  const timer = setTimeout(() => controller.abort(), Math.max(100, timeoutMs));
+  const result = { ok: false, status: 0, text: "", timedOut: false, blocked: false, finishReason: "" };
+  try {
+    const response = await fetch(url, { ...options, signal: controller.signal });
+    result.ok = response.ok;
+    result.status = response.status;
+    if (!response.ok) return result;
+
+    const reader = response.body.pipeThrough(new TextDecoderStream()).getReader();
+    let buffer = "";
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) break;
+      buffer += value;
+      let newline;
+      while ((newline = buffer.indexOf("\n")) >= 0) {
+        const line = buffer.slice(0, newline).trim();
+        buffer = buffer.slice(newline + 1);
+        if (!line.startsWith("data:")) continue;
+        let chunk;
+        try {
+          chunk = JSON.parse(line.slice(5));
+        } catch {
+          continue;
+        }
+        const candidate = chunk?.candidates?.[0];
+        for (const part of candidate?.content?.parts || []) {
+          if (typeof part.text === "string" && !part.thought) result.text += part.text;
+        }
+        if (candidate?.finishReason) result.finishReason = candidate.finishReason;
+        if (chunk?.promptFeedback?.blockReason) result.blocked = true;
+      }
+    }
+    return result;
+  } catch (error) {
+    if (error?.name !== "AbortError") throw error;
+    result.timedOut = true;
+    return result;
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function cutAtSentence(value) {
+  const text = String(value).trim();
+  const sentenceEnd = Math.max(text.lastIndexOf(". "), text.lastIndexOf("! "), text.lastIndexOf("? "));
+  if (/[.!?]$/.test(text)) return text;
+  if (sentenceEnd >= 10) return text.slice(0, sentenceEnd + 1);
+  return text + "…";
 }
 
 function errorForUser(error) {
@@ -262,4 +317,4 @@ export default async function handler(req, res) {
   }
 }
 
-export { aliceResponse, fitAliceText, isSearchIntent, safeHistory, thinkingConfigFor };
+export { aliceResponse, cutAtSentence, fitAliceText, isSearchIntent, safeHistory, thinkingConfigFor };
