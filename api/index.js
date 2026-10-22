@@ -169,6 +169,11 @@ async function askGemini(text, history, searchContext, timeoutMs) {
     result = await callGemini(undefined);
   }
 
+  if (result.timedOut && !result.text.trim()) {
+    console.warn(`Gemini sent nothing within ${Date.now() - startedAt} ms.`);
+    throw new Error("TIME_BUDGET_EXHAUSTED");
+  }
+
   if (!result.ok) {
     const status = Number(result.status);
     console.error("Gemini request failed with HTTP", status);
@@ -179,7 +184,6 @@ async function askGemini(text, history, searchContext, timeoutMs) {
 
   const answer = result.text.trim();
   if (!answer) {
-    if (result.timedOut) throw new Error("TIME_BUDGET_EXHAUSTED");
     if (result.blocked) throw new Error("GEMINI_BLOCKED");
     throw new Error("GEMINI_EMPTY_RESPONSE");
   }
