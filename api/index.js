@@ -45,6 +45,8 @@ function fitAliceText(value) {
   return (lastSpace > 200 ? candidate.slice(0, lastSpace) : candidate).trim() + "…";
 }
 
+const modelsWithoutThinkingConfig = new Set();
+
 // Thinking makes Gemini answer too slowly for Alice, so ask for the smallest amount the model allows.
 function thinkingConfigFor(model) {
   if (/^gemini-2\.5-flash/.test(model)) return { thinkingBudget: 0 };
@@ -157,11 +159,13 @@ async function askGemini(text, history, searchContext, timeoutMs) {
     Math.min(GEMINI_TIMEOUT_MS, timeoutMs) - (Date.now() - startedAt)
   );
 
-  const thinkingConfig = thinkingConfigFor(model);
+  const thinkingConfig = modelsWithoutThinkingConfig.has(model) ? undefined : thinkingConfigFor(model);
   let result = await callGemini(thinkingConfig);
   if (result.status === 400 && thinkingConfig) {
-    // Some models reject the thinking setting; retry once with the model's defaults.
+    // Some models reject the thinking setting; retry once with the model's defaults
+    // and skip the setting on later requests so they don't pay for a second call.
     console.warn("Gemini rejected thinkingConfig; retrying without it.");
+    modelsWithoutThinkingConfig.add(model);
     result = await callGemini(undefined);
   }
 
